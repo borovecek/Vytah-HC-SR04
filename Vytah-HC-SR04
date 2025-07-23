@@ -1,0 +1,274 @@
+/* ==== IR kódy tlačítek (doplň dle svého ovladače) ====
+  #define IR_BTN1_CODE 0xB608A06C // nahrazuje relayInPin1
+  #define IR_BTN2_CODE 0x42A976B4 // nahrazuje relayInPin2
+  #define IR_BTN3_CODE 0x126E9EA8 // zapne relé1 do dosažení vzdálenosti
+  #define IR_BTN4_CODE 0x61611F6C // zapne relé2 do dosažení vzdálenosti*/
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+
+// ==== WiFi AP ====
+const char* ssid = "ESP_Distance";
+const char* password = "12345678";
+
+// ==== HC-SR04 ====
+const int trigPin = 5;
+const int echoPin = 18;
+
+// ==== Vstupní tlačítka ====
+const int relayInPin1 = 12;
+const int relayInPin2 = 13;
+
+// ==== Výstupní relé ====
+const int relayPin1 = 2;
+const int relayPin2 = 15;
+
+// ==== EEPROM adresy ====
+#define EEPROM_SIZE 16
+#define MIN_ADDR 0
+#define MAX_ADDR 4
+#define STOP1_ADDR 8
+#define STOP2_ADDR 12
+
+// ==== IR přijímač ====
+const uint16_t kRecvPin = 4;
+IRrecv irrecv(kRecvPin);
+decode_results results;
+
+// ==== IR kódy (nahraď dle ovladače) ====
+#define IR_BTN1_CODE 0xB608A06C // nahrazuje relayInPin1
+#define IR_BTN2_CODE 0x42A976B4 // nahrazuje relayInPin2
+#define IR_BTN3_CODE 0x126E9EA8 // zapne relé1 do dosažení vzdálenosti
+#define IR_BTN4_CODE 0x61611F6C // zapne relé2 do dosažení vzdálenosti
+
+// ==== Proměnné ====
+long minDistance = 0;
+long maxDistance = 100;
+long stopDistance1 = 30;
+long stopDistance2 = 70;
+long currentDistance = 0;
+
+bool autoRelay1 = false;
+bool autoRelay2 = false;
+bool balanceMode1 = false;
+bool balanceMode2 = false;
+const int balanceTolerance = 5;
+
+unsigned long lastIR1Time = 0;
+unsigned long lastIR2Time = 0;
+const unsigned long holdDuration = 500; // ms
+
+WebServer server(80);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(relayInPin1, INPUT_PULLUP);
+  pinMode(relayInPin2, INPUT_PULLUP);
+  pinMode(relayPin1, OUTPUT);
+  pinMode(relayPin2, OUTPUT);
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadFromEEPROM();
+
+  irrecv.enableIRIn();
+
+  WiFi.softAP(ssid, password);
+  Serial.println("Access Point started");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/distance", []() {
+    currentDistance = readDistanceCM();
+    server.send(200, "text/plain", String(currentDistance));
+  });
+  server.on("/setMin", []() {
+    minDistance = currentDistance;
+    saveToEEPROM();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/setMax", []() {
+    maxDistance = currentDistance;
+    saveToEEPROM();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/setStop1", []() {
+    stopDistance1 = currentDistance;
+    saveToEEPROM();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/setStop2", []() {
+    stopDistance2 = currentDistance;
+    saveToEEPROM();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/status", []() {
+    String json = "{";
+    json += "\"relay1\":" + String(digitalRead(relayPin1) == HIGH ? "true" : "false") + ",";
+    json += "\"relay2\":" + String(digitalRead(relayPin2) == HIGH ? "true" : "false") + ",";
+    json += "\"auto1\":" + String(autoRelay1 ? "true" : "false") + ",";
+    json += "\"auto2\":" + String(autoRelay2 ? "true" : "false") + ",";
+    json += "\"balance1\":" + String(balanceMode1 ? "true" : "false") + ",";
+    json += "\"balance2\":" + String(balanceMode2 ? "true" : "false");
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  handleIR();
+  controlRelay();
+  delay(10);
+}
+
+long readDistanceCM() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  return duration * 0.034 / 2;
+}
+
+void controlRelay() {
+  currentDistance = readDistanceCM();
+
+  bool irIn1 = (millis() - lastIR1Time < holdDuration);
+  bool irIn2 = (millis() - lastIR2Time < holdDuration);
+
+  bool in1 = (digitalRead(relayInPin1) == LOW) || irIn1;
+  bool in2 = (digitalRead(relayInPin2) == LOW) || irIn2;
+
+  if (!balanceMode1 && !balanceMode2) {
+    digitalWrite(relayPin1, (in1 && currentDistance >= minDistance) ? HIGH : LOW);
+    digitalWrite(relayPin2, (in2 && currentDistance <= maxDistance) ? HIGH : LOW);
+  }
+
+  if (balanceMode1) {
+    if (currentDistance > stopDistance1 + balanceTolerance) {
+      digitalWrite(relayPin1, HIGH);
+      digitalWrite(relayPin2, LOW);
+    } else if (currentDistance < stopDistance1 - balanceTolerance) {
+      digitalWrite(relayPin1, LOW);
+      digitalWrite(relayPin2, HIGH);
+    } else {
+      digitalWrite(relayPin1, LOW);
+      digitalWrite(relayPin2, LOW);
+      balanceMode1 = false;
+    }
+  }
+
+  if (balanceMode2) {
+    if (currentDistance > stopDistance2 + balanceTolerance) {
+      digitalWrite(relayPin1, HIGH);
+      digitalWrite(relayPin2, LOW);
+    } else if (currentDistance < stopDistance2 - balanceTolerance) {
+      digitalWrite(relayPin1, LOW);
+      digitalWrite(relayPin2, HIGH);
+    } else {
+      digitalWrite(relayPin1, LOW);
+      digitalWrite(relayPin2, LOW);
+      balanceMode2 = false;
+    }
+  }
+}
+
+void handleIR() {
+  if (irrecv.decode(&results)) {
+    uint32_t code = results.value;
+    Serial.print("IR code: 0x");
+    Serial.println(code, HEX);
+
+    switch (code) {
+      case IR_BTN1_CODE: lastIR1Time = millis(); break;
+      case IR_BTN2_CODE: lastIR2Time = millis(); break;
+      case IR_BTN3_CODE: balanceMode1 = true; balanceMode2 = false; break;
+      case IR_BTN4_CODE: balanceMode2 = true; balanceMode1 = false; break;
+    }
+
+    irrecv.resume();
+  }
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset='UTF-8'>
+<head>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <style>
+    body { font-family: sans-serif; text-align: center; margin-top: 50px; }
+    .value { font-size: 48px; margin: 20px; }
+    .range, .status { font-size: 24px; margin: 10px; }
+    button { font-size: 20px; margin: 10px; padding: 10px; }
+    .on { color: green; font-weight: bold; }
+    .off { color: red; font-weight: normal; }
+  </style>
+  <script>
+    function updateAll() {
+      fetch('/distance')
+        .then(response => response.text())
+        .then(data => {
+          document.getElementById('distance').innerText = data + ' cm';
+        });
+
+      fetch('/status')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('relay1').className = data.relay1 ? 'on' : 'off';
+          document.getElementById('relay2').className = data.relay2 ? 'on' : 'off';
+          document.getElementById('auto1').className = data.auto1 ? 'on' : 'off';
+          document.getElementById('auto2').className = data.auto2 ? 'on' : 'off';
+          document.getElementById('balance1').className = data.balance1 ? 'on' : 'off';
+          document.getElementById('balance2').className = data.balance2 ? 'on' : 'off';
+        });
+    }
+    setInterval(updateAll, 500);
+  </script>
+</head>
+<body>
+  <div class='value' id='distance'>-- cm</div>
+  <div class='range'>Min: )rawliteral" + String(minDistance) + R"rawliteral( cm</div>
+  <div class='range'>Max: )rawliteral" + String(maxDistance) + R"rawliteral( cm</div>
+  <div class='range'>Stop1: )rawliteral" + String(stopDistance1) + R"rawliteral( cm</div>
+  <div class='range'>Stop2: )rawliteral" + String(stopDistance2) + R"rawliteral( cm</div>
+  <div class='status'>Relé 1: <span id='relay1'>●</span></div>
+  <div class='status'>Relé 2: <span id='relay2'>●</span></div>
+  <div class='status'>Auto režim 1: <span id='auto1'>●</span></div>
+  <div class='status'>Auto režim 2: <span id='auto2'>●</span></div>
+  <div class='status'>Balancování 1: <span id='balance1'>●</span></div>
+  <div class='status'>Balancování 2: <span id='balance2'>●</span></div>
+  <form action='/setMin'><button type='submit'>Set Min</button></form>
+  <form action='/setMax'><button type='submit'>Set Max</button></form>
+  <form action='/setStop1'><button type='submit'>Set Stop 1</button></form>
+  <form action='/setStop2'><button type='submit'>Set Stop 2</button></form>
+</body></html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void saveToEEPROM() {
+  EEPROM.writeUInt(MIN_ADDR, minDistance);
+  EEPROM.writeUInt(MAX_ADDR, maxDistance);
+  EEPROM.writeUInt(STOP1_ADDR, stopDistance1);
+  EEPROM.writeUInt(STOP2_ADDR, stopDistance2);
+  EEPROM.commit();
+}
+
+void loadFromEEPROM() {
+  minDistance = EEPROM.readUInt(MIN_ADDR);
+  maxDistance = EEPROM.readUInt(MAX_ADDR);
+  stopDistance1 = EEPROM.readUInt(STOP1_ADDR);
+  stopDistance2 = EEPROM.readUInt(STOP2_ADDR);
+}
