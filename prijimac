@@ -1,0 +1,520 @@
+/* Receiver_ESP32.ino - opravená verze
+   - ESP-NOW příjem SensorData {roll, pitch, distance}
+   - 4 relé: left_up, left_down, right_up, right_down
+   - 2 tlačítka: BOTH_UP (sepne oba nahoru), BOTH_DOWN (sepne oba dolu)
+   - failsafe: pokud > FAILSAFE_MS od posledního paketu → stopAll()
+   - LED_PIN blikne 200 ms při přijetí dat
+   - EEPROM: ukládání offset_roll a 4 stop vzdáleností
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+#include <esp_now.h>
+
+// ==== WiFi AP ====
+const char* ssid = "ESP_Distance";
+const char* password = "12345678";
+
+// ==== EEPROM (adresy v bajtech, paměť 64B je dostačující) ====
+#define EEPROM_SIZE 64
+#define OFFSET_ROLL_ADDR 0           // float (4B)
+#define STOP1_ADDR 4                 // long (4B)
+#define STOP2_ADDR 8
+#define STOP3_ADDR 12
+#define STOP4_ADDR 16
+
+// ==== IR přijímač ====
+const uint16_t kRecvPin = 4;
+IRrecv irrecv(kRecvPin);
+decode_results results;
+
+// Web server
+WebServer server(80);
+
+// ==== Piny relé / tlačítka / LED ====
+#define RELAY_LEFT_UP     12
+#define RELAY_LEFT_DOWN   13
+#define RELAY_RIGHT_UP    27
+#define RELAY_RIGHT_DOWN  14
+
+#define BTN_UP    32  // pullup (GND = stisk)
+#define BTN_DOWN  33
+
+#define LED_PIN 15
+unsigned long ledOnAt = 0;
+const unsigned long LED_BLINK_MS = 200;
+
+// ==== Failsafe a tolerance ====
+const unsigned long FAILSAFE_MS = 1000; // ms
+const float TOLERANCE_DEG = 1.0;        // °
+const float tolerance = 5.0; // povolená odchylka v cm
+bool balancingActive = false;
+bool balancingUp = false;
+float targetDistance = 0;
+
+// IR kódy (nahraď dle svého ovladače)
+#define IR_BTN1_CODE 0xB608A06C // příklad
+#define IR_BTN2_CODE 0x42A976B4
+#define IR_BTN3_CODE 0x126E9EA8
+#define IR_BTN4_CODE 0x61611F6C
+
+typedef struct {
+  float roll;
+  float pitch;
+  float distance;
+} SensorData;
+
+SensorData incoming;                // sdílené struktury - synchronizujeme při čtení/zápisu
+volatile unsigned long lastReceiveTime = 0;
+
+// ====== Funkce pro relé ======
+void setupPins() {
+  pinMode(RELAY_LEFT_UP, OUTPUT);
+  pinMode(RELAY_LEFT_DOWN, OUTPUT);
+  pinMode(RELAY_RIGHT_UP, OUTPUT);
+  pinMode(RELAY_RIGHT_DOWN, OUTPUT);
+
+  // relé vypnout
+  digitalWrite(RELAY_LEFT_UP, LOW);
+  digitalWrite(RELAY_LEFT_DOWN, LOW);
+  digitalWrite(RELAY_RIGHT_UP, LOW);
+  digitalWrite(RELAY_RIGHT_DOWN, LOW);
+
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void stopAll() {
+  digitalWrite(RELAY_LEFT_UP, LOW);
+  digitalWrite(RELAY_LEFT_DOWN, LOW);
+  digitalWrite(RELAY_RIGHT_UP, LOW);
+  digitalWrite(RELAY_RIGHT_DOWN, LOW);
+}
+
+void moveBothUp() {
+  digitalWrite(RELAY_LEFT_UP, HIGH);
+  digitalWrite(RELAY_LEFT_DOWN, LOW);
+  digitalWrite(RELAY_RIGHT_UP, HIGH);
+  digitalWrite(RELAY_RIGHT_DOWN, LOW);
+}
+
+void moveBothDown() {
+  digitalWrite(RELAY_LEFT_UP, LOW);
+  digitalWrite(RELAY_LEFT_DOWN, HIGH);
+  digitalWrite(RELAY_RIGHT_UP, LOW);
+  digitalWrite(RELAY_RIGHT_DOWN, HIGH);
+}
+
+void moveLeftUp() {
+  digitalWrite(RELAY_LEFT_UP, HIGH);
+  digitalWrite(RELAY_LEFT_DOWN, LOW);
+  digitalWrite(RELAY_RIGHT_UP, LOW);
+  digitalWrite(RELAY_RIGHT_DOWN, LOW);
+}
+
+void moveRightUp() {
+  digitalWrite(RELAY_LEFT_UP, LOW);
+  digitalWrite(RELAY_LEFT_DOWN, LOW);
+  digitalWrite(RELAY_RIGHT_UP, HIGH);
+  digitalWrite(RELAY_RIGHT_DOWN, LOW);
+}
+
+// ====== ESP-NOW receive callback (bezpečné přiřazení) ======
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  if (len == sizeof(SensorData)) {
+    SensorData tmp;
+    memcpy(&tmp, incomingData, sizeof(tmp));
+
+    // krátce zamknout přístup pro jistotu (atomic)
+    noInterrupts();
+    incoming = tmp;
+    lastReceiveTime = millis();
+    interrupts();
+
+    // LED blink
+    digitalWrite(LED_PIN, HIGH);
+    ledOnAt = millis();
+  }
+}
+
+// ====== EEPROM save/load ======
+void saveToEEPROM(float offset_roll, long s1, long s2, long s3, long s4) {
+  EEPROM.put(OFFSET_ROLL_ADDR, offset_roll);
+  EEPROM.put(STOP1_ADDR, s1);
+  EEPROM.put(STOP2_ADDR, s2);
+  EEPROM.put(STOP3_ADDR, s3);
+  EEPROM.put(STOP4_ADDR, s4);
+  EEPROM.commit();
+}
+
+void loadFromEEPROM(float &offset_roll, long &s1, long &s2, long &s3, long &s4) {
+  // Pokud EEPROM nikdy nebyla inicializována, hodnoty mohou být "nahodilé".
+  // Můžeš zde přidat validaci (např. rozsah) nebo inicializovat defaulty.
+  EEPROM.get(OFFSET_ROLL_ADDR, offset_roll);
+  EEPROM.get(STOP1_ADDR, s1);
+  EEPROM.get(STOP2_ADDR, s2);
+  EEPROM.get(STOP3_ADDR, s3);
+  EEPROM.get(STOP4_ADDR, s4);
+}
+
+// ====== Globální konfigurovatelné hodnoty (načítané/ukládané do EEPROM) ======
+float offset_roll = 0.0f;
+long stopDistance1 = 30;
+long stopDistance2 = 70;
+long stopDistance3 = 110;
+long stopDistance4 = 150;
+
+// ====== Web handlers ======
+void handleRoot();
+void setupWebHandlers();
+
+void setup() {
+  Serial.begin(115200);
+  setupPins();
+
+  // EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  loadFromEEPROM(offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+  Serial.println("EEPROM loaded:");
+  Serial.printf(" offset_roll=%.2f stop1=%ld stop2=%ld stop3=%ld stop4=%ld\n",
+                offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+
+  // IR
+  irrecv.enableIRIn();
+
+  // WiFi AP
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password);
+  Serial.print("Receiver MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  // ESP-NOW init
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Chyba inicializace ESP-NOW");
+    while (1) delay(100);
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Web server
+  setupWebHandlers();
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void loop() {
+  server.handleClient();
+  handleIR();
+  handleBalancing();
+  unsigned long now = millis();
+
+  // LED auto-vypnutí po LED_BLINK_MS
+  if (ledOnAt != 0 && now - ledOnAt >= LED_BLINK_MS) {
+    digitalWrite(LED_PIN, LOW);
+    ledOnAt = 0;
+  }
+
+  // Failsafe: pokud delší než FAILSAFE_MS od posledního příjmu => vypnout
+  if (lastReceiveTime == 0 || now - lastReceiveTime > FAILSAFE_MS) {
+    stopAll();
+    // Pokud nemáš dál nic provádět, můžeš místo return dělat delay, ale
+    // vrácení zde zabraňuje automatice bez dat. Zanechenu takto úmyslně.
+    return;
+  }
+
+  // Manuální režim (tlačítka) přepíše automatiku
+  bool upPressed = (digitalRead(BTN_UP) == LOW);
+  bool downPressed = (digitalRead(BTN_DOWN) == LOW);
+
+  if (upPressed && !downPressed) {
+    moveBothUp();
+    return;
+  }
+  if (downPressed && !upPressed) {
+    moveBothDown();
+    return;
+  }
+  if (upPressed && downPressed) {
+    stopAll();
+    return;
+  }
+
+  // Automatické vyrovnávání podle roll
+  // čteme přímo atomicky hodnoty z incoming
+  SensorData local;
+  noInterrupts();
+  local = incoming;
+  interrupts();
+
+  float rollVal = local.roll - offset_roll; // kalibrovaný roll
+  float pitchVal = local.pitch;
+  float distVal = local.distance;
+
+  Serial.print("Roll: "); Serial.print(rollVal, 2);
+  Serial.print("  Pitch: "); Serial.print(pitchVal, 2);
+  Serial.print("  Dist: "); Serial.print(distVal, 1);
+  Serial.println(" cm");
+
+  delay(50);
+}
+
+// ====== IR handling (základ) ======
+void handleIR() {
+  if (irrecv.decode(&results)) {
+     if (balancingActive) {
+      balancingActive = false;
+      stopAll();
+      Serial.println("Balancování přerušeno IR signálem");
+    }-
+    uint32_t code = results.value;
+    Serial.print("IR code: 0x");
+    Serial.println(code, HEX);
+    float distVal;
+    noInterrupts();
+    distVal = incoming.distance;
+    interrupts();
+    // zpracuj kódy dle potřeby:
+    switch (code) {
+      case IR_BTN1_CODE:
+        EEPROM.get(STOP1_ADDR, targetDistance);
+        Serial.print("Cílová vzdálenost : ");
+        Serial.println(targetDistance);
+        balancingUp = (distVal < targetDistance);
+        balancingActive = true;
+        break;
+      case IR_BTN2_CODE:
+        EEPROM.get(STOP2_ADDR, targetDistance);
+        Serial.print("Cílová vzdálenost : ");
+        Serial.println(targetDistance);
+        balancingUp = (distVal < targetDistance);
+        balancingActive = true;
+        break;
+      case IR_BTN3_CODE:
+        EEPROM.get(STOP3_ADDR, targetDistance);
+        Serial.print("Cílová vzdálenost : ");
+        Serial.println(targetDistance);
+        balancingUp = (distVal < targetDistance);
+        balancingActive = true;
+        break;
+      case IR_BTN4_CODE:
+        EEPROM.get(STOP4_ADDR, targetDistance);
+        Serial.print("Cílová vzdálenost : ");
+        Serial.println(targetDistance);
+        balancingUp = (distVal < targetDistance);
+        balancingActive = true;
+        break;
+      default:
+        break;
+    }
+
+    irrecv.resume(); // přijímat další
+  }
+}
+
+// ====== Web handlers implementation ======
+void handleRoot() {
+  // jednoduchá stránka, JS načítá /status a /distance
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>ESP Distance</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; margin-top: 30px; }
+    .value { font-size: 48px; margin: 10px; }
+    .range, .status { font-size: 20px; margin: 6px; }
+    button { font-size: 16px; margin: 6px; padding: 8px; }
+    .on { color: green; font-weight: bold; }
+    .off { color: red; font-weight: normal; }
+  </style>
+  <script>
+    async function updateAll() {
+      try {
+        let resp = await fetch('/distance');
+        let d = await resp.text();
+        document.getElementById('distance').innerText = d + ' cm';
+      } catch(e) {
+        document.getElementById('distance').innerText = '-- cm';
+      }
+
+      try {
+        let r = await fetch('/status');
+        let js = await r.json();
+        document.getElementById('relay1').className = js.relay1 ? 'on' : 'off';
+        document.getElementById('relay2').className = js.relay2 ? 'on' : 'off';
+        document.getElementById('relay3').className = js.relay3 ? 'on' : 'off';
+        document.getElementById('relay4').className = js.relay4 ? 'on' : 'off';
+        if (typeof js.roll !== 'undefined') {
+          document.getElementById('roll').innerText = js.roll.toFixed(2) + ' °';
+        }
+      } catch(e) {
+        // ignore
+      }
+    }
+    setInterval(updateAll, 300);
+    window.onload = updateAll;
+  </script>
+</head>
+<body>
+  <div class='value' id='distance'>-- cm</div>
+  <div class='range'>Offset (roll): )rawliteral" + String(offset_roll, 2) + R"rawliteral( °</div>
+  <div class='range'>Náklon: <span id='roll'>-- °</span></div>
+  <div class='range'>Stop1: )rawliteral" + String(stopDistance1) + R"rawliteral( cm</div>
+  <div class='range'>Stop2: )rawliteral" + String(stopDistance2) + R"rawliteral( cm</div>
+  <div class='range'>Stop3: )rawliteral" + String(stopDistance3) + R"rawliteral( cm</div>
+  <div class='range'>Stop4: )rawliteral" + String(stopDistance4) + R"rawliteral( cm</div>
+
+  <div class='status'>Relé 1: <span id='relay1'>●</span></div>
+  <div class='status'>Relé 2: <span id='relay2'>●</span></div>
+  <div class='status'>Relé 3: <span id='relay3'>●</span></div>
+  <div class='status'>Relé 4: <span id='relay4'>●</span></div>
+
+  <form action='/setOffRoll'><button type='submit'>Set offset (roll)</button></form>
+  <form action='/setStop1'><button type='submit'>Set Stop 1</button></form>
+  <form action='/setStop2'><button type='submit'>Set Stop 2</button></form>
+  <form action='/setStop3'><button type='submit'>Set Stop 3</button></form>
+  <form action='/setStop4'><button type='submit'>Set Stop 4</button></form>
+</body>
+</html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void setupWebHandlers() {
+  server.on("/", handleRoot);
+
+  server.on("/distance", []() {
+    // atomicky čteme distance z incoming
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    server.send(200, "text/plain", String(local.distance));
+  });
+
+  server.on("/setOffRoll", []() {
+    // uloží offset z aktuálního rollu
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    offset_roll = local.roll;
+    saveToEEPROM(offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/setStop1", []() {
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    stopDistance1 = (long)local.distance;
+    saveToEEPROM(offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/setStop2", []() {
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    stopDistance2 = (long)local.distance;
+    saveToEEPROM(offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/setStop3", []() {
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    stopDistance3 = (long)local.distance;
+    saveToEEPROM(offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/setStop4", []() {
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    stopDistance4 = (long)local.distance;
+    saveToEEPROM(offset_roll, stopDistance1, stopDistance2, stopDistance3, stopDistance4);
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  // status vrací stav relé + roll (pro UI)
+  server.on("/status", []() {
+    String json = "{";
+    json += "\"relay1\":" + String(digitalRead(RELAY_LEFT_UP) == HIGH ? "true" : "false") + ",";
+    json += "\"relay2\":" + String(digitalRead(RELAY_LEFT_DOWN) == HIGH ? "true" : "false") + ",";
+    json += "\"relay3\":" + String(digitalRead(RELAY_RIGHT_UP) == HIGH ? "true" : "false") + ",";
+    json += "\"relay4\":" + String(digitalRead(RELAY_RIGHT_DOWN) == HIGH ? "true" : "false") + ",";
+
+    // přidáme roll (aktuální)
+    SensorData local;
+    noInterrupts();
+    local = incoming;
+    interrupts();
+    json += "\"roll\":" + String(local.roll, 2) + ",";
+    json += "\"distance\":" + String(local.distance, 1);
+
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+}
+void handleBalancing() {
+  if (!balancingActive) return;
+
+  SensorData local;
+  noInterrupts();
+  local = incoming;
+  interrupts();
+
+  float rollVal = local.roll - offset_roll;
+  float distVal = local.distance;
+
+  if (balancingUp) {
+    if (distVal < targetDistance - tolerance) {
+      moveBothUp();
+    } else {
+      if (rollVal > TOLERANCE_DEG) {
+        moveRightUp();
+      } else if (rollVal < -TOLERANCE_DEG) {
+        moveLeftUp();
+      } else {
+        stopAll();
+        balancingActive = false;
+        Serial.println("Balancování dokončeno");
+      }
+    }
+  }
+  else {
+    if (distVal > targetDistance + tolerance) {
+      moveBothDown();
+    } else {
+      if (rollVal > TOLERANCE_DEG) {
+        moveRightUp();
+      } else if (rollVal < -TOLERANCE_DEG) {
+        moveLeftUp();
+      } else {
+        stopAll();
+        balancingActive = false;
+        Serial.println("Balancování dokončeno");
+      }
+    }
+  }
+}
