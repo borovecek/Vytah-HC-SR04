@@ -1,0 +1,131 @@
+/* Sender_ESP32.ino
+   - MPU6050_light (roll)
+   - NewPing HC-SR04 (průměr z PING_SAMPLES)
+   - ESP-NOW odeslání dat (SensorData)
+   - LED_PIN blikne 200 ms při úspěšném odeslání (OnDataSent)
+*/
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <NewPing.h>
+
+// --- MPU6050 ---
+MPU6050 mpu(Wire);
+
+// --- HC-SR04 (NewPing) ---
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define MAX_DISTANCE_CM 300
+#define PING_SAMPLES 5
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE_CM);
+
+// --- data ---
+typedef struct {
+  float roll;
+  float pitch;
+  float distance; // cm
+} SensorData;
+
+SensorData dataToSend;
+
+// --- ESP-NOW: nastav MAC přijímače sem ---
+uint8_t receiverMAC[] = { 0xA8, 0x48, 0xFA, 0x83, 0xAA, 0xC4 }; // <- změň podle svého přijímače!
+
+// --- LED indikace spojení ---
+#define LED_PIN 2
+volatile unsigned long ledOnAt = 0;
+const unsigned long LED_BLINK_MS = 200;
+
+// --- callback po odeslání ---
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    digitalWrite(LED_PIN, HIGH);
+    ledOnAt = millis();
+  } else {
+    // necháme LED zhasnutou při chybě
+  }
+}
+
+float getDistanceAvgCM(uint8_t samples) {
+  float sum = 0;
+  uint8_t valid = 0;
+  for (uint8_t i = 0; i < samples; i++) {
+    unsigned int d = sonar.ping_cm();
+    if (d > 0 && d <= MAX_DISTANCE_CM) {
+      sum += d;
+      valid++;
+    }
+    delay(25);
+  }
+  if (valid == 0) return 0.0f; // mimo rozsah / žádné platné měření
+  return sum / valid;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // MPU6050 init
+  byte status = mpu.begin();
+  if (status != 0) {
+    Serial.print("MPU6050 chyba: ");
+    Serial.println(status);
+    while (1) delay(100);
+  }
+  mpu.calcGyroOffsets();
+
+  // ESP-NOW init
+  WiFi.mode(WIFI_STA); // doporučeno pro ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Chyba inicializace ESP-NOW");
+    while (1) delay(100);
+  }
+  esp_now_register_send_cb(OnDataSent);
+
+  // přidat peer (receiver)
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Pozor: nepovedlo se přidat peer (možná už existuje)");
+  }
+
+  Serial.println("Sender ready. Změň receiverMAC v kódu na MAC přijímače (viz Receiver Serial).");
+}
+
+void loop() {
+  // čtení MPU
+  mpu.update();
+  dataToSend.roll = mpu.getAngleX(); // roll (střídání orientací dle montáže senzoru)
+  dataToSend.pitch = mpu.getAngleY();
+  
+  // čtení vzdálenosti (průměr)
+  dataToSend.distance = getDistanceAvgCM(PING_SAMPLES);
+
+  // odeslání přes ESP-NOW
+  esp_err_t res = esp_now_send(receiverMAC, (uint8_t *)&dataToSend, sizeof(dataToSend));
+  if (res != ESP_OK) {
+    Serial.print("esp_now_send chyba: ");
+    Serial.println(res);
+  }
+
+  // debug výpis
+ Serial.print("Roll: "); Serial.print(dataToSend.roll);
+  Serial.print("  Pitch: "); Serial.print(dataToSend.pitch);
+  Serial.print("  Vzdalenost: "); Serial.print(dataToSend.distance);
+  Serial.println(" cm");
+
+  // LED auto-vypnutí po LED_BLINK_MS (OnDataSent LED zapíná)
+  if (ledOnAt != 0 && millis() - ledOnAt >= LED_BLINK_MS) {
+    digitalWrite(LED_PIN, LOW);
+    ledOnAt = 0;
+  }
+
+  delay(100); // interval odesílání ~100 ms
+}
