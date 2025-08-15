@@ -641,7 +641,7 @@ void updateLEDs(float distance) {
     strip.setPixelColor(0,
       strip.Color(stopColors[idx].r, stopColors[idx].g, stopColors[idx].b,
                   stopColors[idx].w));
-    strip.setBrightness(stopColors[idx].brightness);
+    strip.setBrightness(stopColors[idx].bri);
     strip.show();
   } else {
     // LED zhasnout, pokud není žádná pozice
@@ -798,7 +798,6 @@ void handleBalancing() {
     Serial.println("Dosaženo maximální vzdálenosti");
     return;
   }
-  long distVal = local.distance;
 
   if (distVal >= stopDistance1 - tolerance && distVal <= stopDistance1 + tolerance) {
     setLEDForStop(0);
@@ -851,7 +850,7 @@ void handleSetStopLED() {
       stopColors[idx].g = server.arg("g").toInt();
       stopColors[idx].b = server.arg("b").toInt();
       stopColors[idx].w = server.arg("w").toInt();
-      stopColors[idx].brightness = server.arg("br").toInt();
+      stopColors[idx].bri = server.arg("br").toInt();
     }
   }
   server.send(200, "text/plain", "OK");
