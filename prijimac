@@ -270,7 +270,7 @@ void handleIR() {
       balancingActive = false;
       stopAll();
       Serial.println("Balancování přerušeno IR signálem");
-    }-
+    }
     uint32_t code = results.value;
     Serial.print("IR code: 0x");
     Serial.println(code, HEX);
